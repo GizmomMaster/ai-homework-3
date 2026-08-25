@@ -1,1 +1,0 @@
-# ai-homework-3
