@@ -10,6 +10,8 @@ Read-only MCP-сервер для SQLite. Работает по stdio, испо�
   `customers_by_order_count` — специализированные tools под частые вопросы
   аналитики магазина, чтобы агенту не приходилось каждый раз писать JOIN руками.
 
+Параметры и формат ответа каждого — в разделе [MCP tools](#mcp-tools).
+
 ## Install
 
 Проект на Node.js/TypeScript — зависимости описаны в `package.json` /
@@ -107,9 +109,106 @@ claude mcp get sqlite-db
 
 После перезапуска хоста агенту станут доступны все инструменты сервера.
 
+## MCP tools
+
+Сервер отдаёт 7 инструментов. Все помечены `readOnlyHint: true`,
+`idempotentHint: true`, `openWorldHint: false` — ни один не пишет в базу.
+Результат всегда возвращается как JSON-текст; ошибка — как `isError: true` с
+подсказкой, что делать дальше (несуществующая таблица, опечатка в колонке,
+синтаксическая ошибка), без Node-стектрейса.
+
+### Общего назначения
+
+#### `list_tables`
+
+Параметров нет. Возвращает все таблицы базы (кроме служебных `sqlite_%`) с их
+колонками — точка входа для агента, чтобы узнать, какие данные вообще есть.
+
+```json
+[{ "table": "customers",
+   "columns": [{ "name": "id", "type": "INTEGER", "notNull": false, "primaryKey": true }] }]
+```
+
+Не возвращает количество строк и примеры данных — для этого `describe_table`.
+
+#### `describe_table`
+
+| Параметр | Тип | По умолч. | Описание |
+|---|---|---|---|
+| `table` | `string` | — | Точное имя таблицы (регистрозависимо), как в `list_tables` |
+
+Возвращает `{ table, columns, rowCount, sample }`: схему колонок
+(`PRAGMA table_info`), точное число строк (`COUNT(*)`) и до 3 примеров строк.
+Если таблицы нет — `isError` с подсказкой вызвать `list_tables`.
+
+#### `run_query`
+
+Произвольный read-only SQL с пагинацией.
+
+| Параметр | Тип | По умолч. | Описание |
+|---|---|---|---|
+| `sql` | `string` | — | Один `SELECT` или `WITH ... SELECT`, **без собственного `LIMIT`/`OFFSET`** |
+| `limit` | `int` 1–200 | `100` | Сколько строк вернуть в этой странице |
+| `offset` | `int` ≥ 0 | `0` | Сколько строк пропустить |
+
+Возвращает страницу результата:
+
+```json
+{ "rows": [...], "returned": 100, "limit": 100, "offset": 0,
+  "hasMore": true, "nextOffset": 100 }
+```
+
+`hasMore`/`nextOffset` позволяют пройти весь результат постранично, не утонув в
+тысячах строк за один вызов; собственный `ORDER BY` запроса сохраняется между
+страницами. Запросы, изменяющие данные или схему
+(`INSERT`/`UPDATE`/`DELETE`/`DROP`/`ALTER`/`CREATE`/`PRAGMA`/`REPLACE INTO`), а
+также несколько statement'ов за вызов — отклоняются (см.
+[SPEC.md §5](./SPEC.md), три независимых слоя защиты).
+
+### Специализированные (схема магазина)
+
+Готовые версии JOIN'ов, которые иначе агенту приходилось бы писать руками при
+каждом вопросе «топ N ...». Завязаны на таблицы
+`customers` / `orders` / `order_items` / `products`; на базе без них вернут
+понятную ошибку `no such table`, а не упадут.
+
+| Tool | Параметры | Возвращает |
+|---|---|---|
+| `top_customers_by_spend` | `limit` (1–50, def. `10`), `excludeCancelled` (def. `true`) | Клиенты по сумме заказов: `id`, `first_name`, `last_name`, `email`, `total_spent` |
+| `top_selling_products` | `limit` (1–50, def. `10`), `rankBy`: `units_sold` \| `revenue` (def. `units_sold`), `excludeCancelled` (def. `true`) | Товары-бестселлеры: `name`, `category`, `units_sold`, `revenue` |
+| `revenue_by_category` | `limit` (1–50, def. `10`), `excludeCancelled` (def. `true`) | Категории по выручке: `category`, `revenue`, `units_sold` |
+| `customers_by_order_count` | `limit` (1–50, def. `10`) | Клиенты по числу заказов (**все** статусы): `id`, `first_name`, `last_name`, `email`, `orders_count` |
+
+`excludeCancelled` (по умолчанию `true`) исключает из подсчёта заказы со
+статусом `cancelled`. У `customers_by_order_count` этого параметра нет: он
+ранжирует по количеству заказов всех статусов — для ранжирования по деньгам
+нужен `top_customers_by_spend`.
+
+## Структура кода
+
+```
+src/
+  index.ts            точка входа: читает конфиг, открывает БД, поднимает stdio-транспорт
+  config.ts           резолв пути к БД (DB_PATH / argv) относительно корня проекта
+  db.ts               открытие БД read-only, экранирование идентификаторов, проверка таблиц
+  errors.ts           ToolError + перевод ошибок SQLite в понятные подсказки
+  sql-guard.ts        слой 2 read-only-гарантии: правила допуска SQL в run_query
+  server.ts           сборка McpServer и регистрация всех наборов инструментов
+  tools/
+    register.ts       общая обвязка: readOnly-аннотации, JSON-ответ, обработка ошибок
+    schema.ts         list_tables, describe_table
+    query.ts          run_query
+    analytics.ts      четыре специализированных аналитических инструмента
+```
+
+Обработка ошибок и сериализация ответа живут в `tools/register.ts`, поэтому хендлер
+инструмента возвращает обычные данные, а отказ выражает через `throw new ToolError(...)` —
+`try/catch` и `JSON.stringify` в каждом инструменте не дублируются.
+
 ## Tests
 
-Автотесты (`node --test`, встроенный test runner, без доп. фреймворка)
+Автотесты (`node --test`, встроенный test runner, без доп. фреймворка) — двух уровней.
+Юнит-тесты (`tests/sql-guard.test.ts`) вызывают чистые функции напрямую; остальные
 поднимают собранный сервер (`dist/index.js`) как реальный MCP stdio-процесс
 через `@modelcontextprotocol/sdk`-клиент и гоняют его против детерминированной
 фикстур-базы (`tests/fixture.ts` — не связана с `sqlitedb/shop.db`, так что
@@ -119,7 +218,7 @@ claude mcp get sqlite-db
 npm test
 ```
 
-`pretest` сам сделает `npm run build`. Покрытие (41 тест):
+`pretest` сам сделает `npm run build`. Покрытие (53 теста):
 
 | Файл | Что проверяет |
 |---|---|
@@ -129,6 +228,7 @@ npm test
 | `tests/errors.test.ts` | Понятные сообщения на `no such table`/`no such column`/синтаксическую ошибку, отсутствие stack trace в любом ответе tool'а |
 | `tests/specialized-tools.test.ts` | Корректность агрегаций всех четырёх специализированных tools, поведение `excludeCancelled`, деградация на БД без нужных таблиц |
 | `tests/startup.test.ts` | Чистый (без stack trace) отказ процесса при отсутствующем/невалидном `DB_PATH` |
+| `tests/sql-guard.test.ts` | Юнит-тесты правил read-only-фильтра и экранирования идентификаторов — без запуска процесса, поэтому регрессия сразу указывает на конкретную функцию |
 
 ## Docker
 
@@ -156,9 +256,3 @@ claude mcp add sqlite-db-docker -s local -- \
     -e DB_PATH=/data/shop.db \
     sqlite-mcp-server
 ```
-
-Проверено вживую (`docker.io` 29.1.3, Ubuntu 24.04): `docker build` собирает образ
-(338MB) без ошибок, а полный MCP-протокол (`initialize` → `tools/list` →
-`run_query`/`top_customers_by_spend` → отказ на `DELETE`/`PRAGMA`) через
-`docker run -i` с `shop.db`, примонтированной как `:ro`, отработал идентично
-запуску вне контейнера.

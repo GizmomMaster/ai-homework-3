@@ -1,6 +1,6 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { createFixtureDb, EXPECTED } from "./fixture.js";
+import { createFixtureDb, createTempDb, EXPECTED } from "./fixture.js";
 import { withClient, jsonOf } from "./client.js";
 
 let fixture: ReturnType<typeof createFixtureDb>;
@@ -88,24 +88,14 @@ test("revenue_by_category aggregates across products within each category", asyn
 test("specialized tools report a friendly error (not a crash) against a database missing the expected tables", async () => {
   // A bare SQLite file with none of the shop tables — the specialized tools should
   // degrade to a clear, actionable error instead of an unhandled exception.
-  const fs = await import("node:fs");
-  const os = await import("node:os");
-  const path = await import("node:path");
-  const Database = (await import("better-sqlite3")).default;
-
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sqlite-mcp-empty-"));
-  const dbPath = path.join(dir, "empty.db");
-  const db = new Database(dbPath);
-  db.exec("CREATE TABLE unrelated (id INTEGER)");
-  db.close();
-
+  const other = createTempDb((db) => db.exec("CREATE TABLE unrelated (id INTEGER)"));
   try {
-    await withClient(dbPath, async (client) => {
+    await withClient(other.dbPath, async (client) => {
       const result: any = await client.callTool({ name: "top_customers_by_spend", arguments: {} });
       assert.equal(result.isError, true);
       assert.match(result.content[0].text, /does not exist/);
     });
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
+    other.cleanup();
   }
 });
