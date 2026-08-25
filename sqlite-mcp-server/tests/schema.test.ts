@@ -1,6 +1,6 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { createFixtureDb } from "./fixture.js";
+import { createFixtureDb, createTempDb } from "./fixture.js";
 import { withClient, jsonOf, textOf } from "./client.js";
 
 let fixture: ReturnType<typeof createFixtureDb>;
@@ -70,4 +70,25 @@ test("run_query and the specialized top-N tools cross-reference each other in th
     // and the dedicated tools should disambiguate from their closest sibling
     assert.match(byOrderCount.description!, /top_customers_by_spend/);
   });
+});
+
+test("describe_table handles a table name that needs SQL quoting", async () => {
+  // Identifiers can't be bound as parameters, so they are interpolated — with SQLite's own
+  // quoting rules ("" for an embedded quote), not JSON escaping, which SQLite rejects.
+  const quirky = createTempDb((db) => {
+    db.exec('CREATE TABLE "we""ird name" (id INTEGER)');
+    db.exec('INSERT INTO "we""ird name" (id) VALUES (1), (2)');
+  });
+  try {
+    await withClient(quirky.dbPath, async (client) => {
+      const info = jsonOf(await client.callTool({ name: "describe_table", arguments: { table: 'we"ird name' } }));
+      assert.equal(info.rowCount, 2);
+      assert.deepEqual(info.sample, [{ id: 1 }, { id: 2 }]);
+
+      const tables = jsonOf(await client.callTool({ name: "list_tables", arguments: {} }));
+      assert.deepEqual(tables[0].columns.map((c: any) => c.name), ["id"]);
+    });
+  } finally {
+    quirky.cleanup();
+  }
 });

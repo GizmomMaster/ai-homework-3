@@ -18,6 +18,38 @@ MCP-сервер, предоставляющий Claude доступ на чте
 
 Сервер — обычный Node.js-процесс, запускаемый напрямую (`node dist/index.js`), без сети и без демонов.
 
+### 2.1 Структура исходников
+
+Код разбит по зонам ответственности; точка входа не содержит бизнес-логики.
+
+| Модуль | Ответственность |
+|---|---|
+| `src/index.ts` | точка входа: конфиг → открытие БД → stdio-транспорт; перехват `ConfigError` → одна строка в stderr + exit 1 |
+| `src/config.ts` | выбор пути к БД (`DB_PATH` / первый CLI-аргумент) и его резолв относительно корня проекта |
+| `src/db.ts` | открытие соединения `readonly`, `quoteIdentifier()`, `tableExists()` |
+| `src/errors.ts` | `ToolError` (отказ, показываемый вызывающему дословно) и `friendlySqlError()` (§6) |
+| `src/sql-guard.ts` | слой 2 read-only-гарантии (§5): `assertReadOnlySelect()`, `assertNoOwnPagination()` |
+| `src/server.ts` | сборка `McpServer` и регистрация наборов инструментов |
+| `src/tools/register.ts` | общая обвязка регистрации: read-only-аннотации, `JSON.stringify` ответа, `try/catch` → `friendlySqlError` |
+| `src/tools/schema.ts` | `list_tables`, `describe_table` (§4.1–4.2) |
+| `src/tools/query.ts` | `run_query` (§4.3) |
+| `src/tools/analytics.ts` | специализированные аналитические инструменты (§4.4–4.7) |
+
+Хендлер инструмента возвращает обычные данные и не занимается сериализацией и
+`try/catch` — это делает `registerReadOnlyTool()`. Отказ (например, несуществующая
+таблица в `describe_table` или запрещённый SQL) выражается через `throw new ToolError(msg)`
+и превращается в `isError: true` с текстом `msg`; любое другое исключение считается
+ошибкой SQL и проходит через `friendlySqlError()`. Благодаря этому набор
+read-only-аннотаций и формат ответа заданы в одном месте и не могут разъехаться между
+инструментами.
+
+**Экранирование идентификаторов.** Имя таблицы нельзя передать как параметр запроса, поэтому
+в `PRAGMA table_info(...)` / `FROM ...` оно подставляется в текст SQL через
+`quoteIdentifier()` — двойные кавычки с удвоением внутренних, по правилам SQLite. (Ранее
+использовался `JSON.stringify`, который экранирует кавычку как `\"` — валидный JSON, но
+невалидный SQL: имя вида `we"ird` приводило к `unrecognized token`. Закрыто тестом
+`describe_table handles a table name that needs SQL quoting`.)
+
 ## 3. Конфигурация
 
 | Переменная / аргумент | Обязательность | Описание |
@@ -112,7 +144,7 @@ new Database(dbPath, { readonly: true, fileMustExist: true })
 В сервере физически нет tool'ов `insert_row`, `update_row`, `delete_row` и т.п. Единственный способ
 выполнить произвольный SQL — `run_query`, и он проходит через слои 2 и 3.
 
-### Слой 2 — валидация текста запроса в `run_query` (`src/index.ts`, до вызова `db.prepare`)
+### Слой 2 — валидация текста запроса в `run_query` (`src/sql-guard.ts`, до вызова `db.prepare`)
 
 Выполняется до передачи запроса в драйвер БД, в следующем порядке:
 
@@ -185,7 +217,7 @@ npm install       # установка зависимостей (better-sqlite3 
 npm run build      # tsc: src/ -> dist/
 npm run dev        # запуск через tsx без сборки (для разработки)
 DB_PATH=/path/to.db npm start   # прод-запуск скомпилированной версии
-npm test           # 41 автотест (node:test); pretest сам вызывает npm run build
+npm test           # 53 автотеста (node:test); pretest сам вызывает npm run build
 ```
 
 Тесты (`tests/*.test.ts`) не трогают `sqlitedb/shop.db` — каждый файл поднимает собранный сервер
@@ -196,7 +228,12 @@ npm test           # 41 автотест (node:test); pretest сам вызыв�
 гарантии (включая обходы), пагинация и сохранение порядка между страницами, понятные ошибки,
 отсутствие stack trace (в ответах tools и при невалидном `DB_PATH` на старте), корректность всех
 специализированных tools и их деградация на «чужой» схеме БД, наличие/длина `description` и
-`readOnlyHint` у каждого tool'а.
+`readOnlyHint` у каждого tool'а, корректное экранирование «неудобных» имён таблиц.
+
+Отдельно `tests/sql-guard.test.ts` проверяет чистые функции `src/sql-guard.ts` и
+`quoteIdentifier()` напрямую, без запуска процесса: те же правила, что и в
+`read-only.test.ts`, но провал такого теста сразу указывает на конкретную функцию, а не на
+поведение сервера в целом.
 
 ## 8. Регистрация в Claude Code
 
